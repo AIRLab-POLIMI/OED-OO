@@ -1,0 +1,11 @@
+numpy<2
+scipy 
+Pillow 
+opencv-python==4.7.0.72 
+pycocotools 
+packaging 
+six 
+thop 
+tqdm 
+matplotlib 
+tensorboard

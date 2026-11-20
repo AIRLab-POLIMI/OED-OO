@@ -1,0 +1,7 @@
+docker build --rm -t busso/oed_base:v1 .
+
+oed_testing
+
+run-docker 2 0-3 \
+python scripts/eval_spatial_sgdet.py
+python scripts/eval_temporal_sgdet.py
