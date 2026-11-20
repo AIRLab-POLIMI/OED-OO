@@ -22,6 +22,7 @@ from thop import profile
 from tqdm import tqdm
 import time
 
+from util.diagnostics import diagnose_objobj 
 
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
@@ -105,13 +106,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 def evaluate_dsgg(dataset_file, model, postprocessors, data_loader, device, args):
     model.eval()
 
-    evaluator1 = BasicSceneGraphEvaluator(mode=args.dsgg_task, iou_threshold=0.5, constraint='with', nms_filter=args.use_nms_filter)
-    evaluator2 = BasicSceneGraphEvaluator(mode=args.dsgg_task, iou_threshold=0.5, constraint='no', nms_filter=args.use_nms_filter)
+    evaluator1 = BasicSceneGraphEvaluator(mode=args.dsgg_task, iou_threshold=0.5, constraint='with', nms_filter=args.use_nms_filter, args=args)
+    evaluator2 = BasicSceneGraphEvaluator(mode=args.dsgg_task, iou_threshold=0.5, constraint='no', nms_filter=args.use_nms_filter, args=args)
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
     save_prediction = False
     preds_dict = {}
+    diag_gts, diag_preds = [], []
     to_test = 1000
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         # samples.tensors = samples.tensors.half() # TODO
@@ -124,7 +126,7 @@ def evaluate_dsgg(dataset_file, model, postprocessors, data_loader, device, args
             outputs = model(samples, targets=in_targets, cur_idx=cur_idx)
         else:
             outputs = model(samples, targets=in_targets)
-        if len(targets) > 1 and args.dsgg_task == 'sgdet' and args.dataset_file == 'ag_multi':
+        if len(targets) > 1 and args.dsgg_task == 'sgdet' and 'multi' in args.dataset_file:
             targets = [targets[0]]
 
         # if args.dsgg_task == 'sgdet':
@@ -157,7 +159,7 @@ def evaluate_dsgg(dataset_file, model, postprocessors, data_loader, device, args
             results = postprocessors['dsgg'](outputs, orig_target_sizes)
         else:
             cur_idx = 0
-            if args.dataset_file == 'ag_multi':
+            if 'multi' in args.dataset_file:
                 cur_idx = targets[0]['cur_idx']
                 targets = [targets[cur_idx]]
             if args.seq_sort:
@@ -167,12 +169,20 @@ def evaluate_dsgg(dataset_file, model, postprocessors, data_loader, device, args
         if save_prediction:
             preds_dict[targets[0]['img_path']] = results
 
+
+        if 'star' in args.dataset_file:
+            diag_gts.extend([{k: (v.cpu() if torch.is_tensor(v) else v) for k, v in t.items()} for t in targets])
+            diag_preds.extend(results)
+
         evaluator1.evaluate_scene_graph(targets, results)
         evaluator2.evaluate_scene_graph(targets, results)
         # to_test -= 1
         # if to_test == 0:
         #     break
     metric_logger.synchronize_between_processes()
+
+    if 'star' in args.dataset_file and utils.is_main_process():
+        diagnose_objobj(diag_gts, diag_preds)
 
     # if save_prediction:
     #     with open('sgdet_single_preds_dict.pkl', 'wb') as f:

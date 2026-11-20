@@ -6,21 +6,74 @@ from util.misc import intersect_2d, argsort_desc
 from util.box_ops import box_iou, box_cxcywh_to_xyxy
 import pdb
 
+# keep the original module-level imports, plus nothing new:
+# REL_GROUPS is imported lazily inside __init__, so the AG path never needs the STAR module.
+
+BASE_REL_NAMES = ("looking_at", "not_looking_at", "unsure", "above", "beneath",
+                  "in_front_of", "behind", "on_the_side_of", "in", "carrying",
+                  "covered_by", "drinking_from", "eating", "have_it_on_the_back",
+                  "holding", "leaning_on", "lying_on", "not_contacting",
+                  "other_relationship", "sitting_on", "standing_on", "touching",
+                  "twisting", "wearing", "wiping", "writing_on")
+EXTRA_REL_NAMES = {26: "on", 27: "at", 28: "under", 29: "near"}
+
+def rel_id_to_name(rid):
+    return BASE_REL_NAMES[rid] if rid < len(BASE_REL_NAMES) else EXTRA_REL_NAMES[rid]
+
+###
+# AG spatial cols = id-3 (ids 3..8), contact cols = id-9 (ids 9..25)
+KEEP_SP = [0, 1, 2, 3, 4]                              # drops id 8 'in'
+KEEP_CO = [0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16]   # drops ids 17, 18
+###
+
 class BasicSceneGraphEvaluator:
-    def __init__(self, mode, iou_threshold=0.5, save_file="tmp", constraint=False, semithreshold=None, error_analysis=False, nms_filter=False):
+    SUBSETS = ('person', 'objobj')   # only used for the STAR version
+
+    def __init__(self, mode, iou_threshold=0.5, save_file="tmp", constraint=False, semithreshold=None,
+                 error_analysis=False, nms_filter=False, args=None, person_id=1):
+        dataset_file = getattr(args, 'dataset_file', 'ag') if args is not None else 'ag'
+        if 'star' in dataset_file:
+            self.version = 'star'
+        elif 'ag' in dataset_file:
+            self.version = 'ag'
+        else:
+            raise NotImplementedError(f'unknown dataset_file: {dataset_file}')
+
         self.result_dict = {}
         self.mode = mode
-        self.num_rel = 26
-        self.num_attn = 3
-        self.num_spatial = 6
-        self.num_contact = 17
-        self.result_dict[self.mode + '_recall'] = {10: [], 20: [], 50: [], 100: []}  
-        self.result_dict[self.mode + '_pair_recall'] = {10: [], 20: [], 50: [], 100: []}  
-        self.result_dict[self.mode + '_mean_recall_collect'] = {10: [[] for i in range(self.num_rel)], 20: [[] for i in range(self.num_rel)], 50: [[] for i in range(self.num_rel)], 100: [[] for i in range(self.num_rel)]}
+        self.person_id = person_id
+
+        if self.version == 'ag':
+            self.num_attn = 3
+            self.num_spatial = 6
+            self.num_contact = 17
+            self.num_rel = 26
+            self.RELATION_CLASSES = BASE_REL_NAMES
+        else:
+            from datasets.star_single import REL_GROUPS      # adjust to your module path
+            self.spatial_ids = list(REL_GROUPS['spatial'])
+            self.contact_ids = list(REL_GROUPS['contacting'])
+            self.num_attn = 0
+            self.num_spatial = len(self.spatial_ids)
+            self.num_contact = len(self.contact_ids)
+            self.num_rel = self.num_spatial + self.num_contact
+            self.RELATION_CLASSES = tuple(rel_id_to_name(r) for r in self.spatial_ids + self.contact_ids)
+        self.tot_all_predicates = self.num_rel
+
+        ###
+        self.vocab_match = bool(getattr(args, 'eval_star_vocab', False)) and self.version == 'ag'
+        if self.vocab_match:
+            self.num_attn, self.num_spatial, self.num_contact = 0, len(KEEP_SP), len(KEEP_CO)
+            self.num_rel = self.num_spatial + self.num_contact
+            self.RELATION_CLASSES = tuple(BASE_REL_NAMES[3 + c] for c in KEEP_SP) + \
+                                    tuple(BASE_REL_NAMES[9 + c] for c in KEEP_CO)
+            self.tot_all_predicates = self.num_rel
+        ###
+
+        self.reset_result()
         self.constraint = constraint # semi constraint if True
         self.iou_threshold = iou_threshold
         self.semithreshold = semithreshold
-        self.tot_all_predicates = 26
         self.save_file = save_file
         with open(self.save_file, "w") as f:
             f.write("Begin training\n")
@@ -33,32 +86,28 @@ class BasicSceneGraphEvaluator:
         self.nms_filter = nms_filter
         self.print_cls_rec1 = False # other way
         self.print_cls_rec2 = False # tempura way
-        self.RELATION_CLASSES = ("looking_at", "not_looking_at", "unsure", "above", "beneath",
-                    "in_front_of", "behind", "on_the_side_of", "in", "carrying",
-                    "covered_by", "drinking_from", "eating", "have_it_on_the_back",
-                    "holding", "leaning_on", "lying_on", "not_contacting",
-                    "other_relationship", "sitting_on", "standing_on", "touching",
-                    "twisting", "wearing", "wiping", "writing_on")
 
         self.error_mat = None
         self.error_analysis = error_analysis and self.mode == 'sgdet'
         if self.error_analysis:
+            if self.version == 'star':
+                raise NotImplementedError("error_analysis assumes a person subject (not adapted to STAR)")
             self.error_mat = np.zeros((self.num_rel, 5+1), dtype=int) # 5 error type, 1 for total error number
-        
+
         self.save_cases = 0
         self.easy_bad_case = []
         self.hard_bad_case = []
 
     def reset_result(self):
-        self.result_dict[self.mode + '_recall'] = {10: [], 20: [], 50: [], 100: []}  
-        self.result_dict[self.mode + '_pair_recall'] = {10: [], 20: [], 50: [], 100: []}  
-        self.result_dict[self.mode + '_mean_recall_collect'] = {10: [[] for i in range(self.num_rel)], 20: [[] for i in range(self.num_rel)], 50: [[] for i in range(self.num_rel)], 100: [[] for i in range(self.num_rel)]}
+        m, ks = self.mode, (10, 20, 50, 100)
+        self.result_dict[m + '_recall'] = {k: [] for k in ks}
+        self.result_dict[m + '_pair_recall'] = {k: [] for k in ks}
+        self.result_dict[m + '_mean_recall_collect'] = {k: [[] for _ in range(self.num_rel)] for k in ks}
+        if self.version == 'star':
+            for name in self.SUBSETS:
+                self.result_dict[f'{m}_recall_{name}'] = {k: [] for k in ks}
 
     def print_stats(self):
-        # print('--------------------------------------')
-        # print('miss_gt:', self.miss_gt, '; wrong_rel:', self.wrong_rel)
-        # print('--------------------------------------')
-
         stats_dict = {}
         with open(self.save_file, "a") as f:
             f.write('======================' + self.mode + '============================\n')
@@ -67,124 +116,212 @@ class BasicSceneGraphEvaluator:
                 print('R@%i: %f' % (k, np.mean(v)))
                 f.write('R@%i: %f\n' % (k, np.mean(v)))
                 stats_dict['R@%i' % k] = np.mean(v)
-                # f.print(self.error_mat)
-            # for k, v in self.result_dict[self.mode + '_pair_recall'].items():
-            #     print('pair R@%i: %f' % (k, np.mean(v)))
-            #     stats_dict['pair R@%i' % k] = np.mean(v)
-            
+
+            if self.version == 'star':
+                # recall split by triplet type (mean over frames with at least one such GT triplet)
+                for name in self.SUBSETS:
+                    for k, v in self.result_dict[f'{self.mode}_recall_{name}'].items():
+                        val = np.mean(v) if len(v) else float('nan')
+                        line = 'R@%i [%s, %d frames]: %f' % (k, name, len(v), val)
+                        print(line)
+                        f.write(line + '\n')
+                        stats_dict['R@%i_%s' % (k, name)] = val
+
             if self.print_cls_rec1:
                 print('             ----------- class recall way 1 ----------')
                 for k, v in self.result_dict[self.mode + '_mean_recall_collect'].items():
                     sum_recall = 0 # overall_mean_recall
                     class_recall = []
                     for idx in range(self.num_rel):
-                        if len(v[idx]) == 0:
-                            tmp_recall = 0.0
-                        else:
-                            tmp_recall = np.mean(v[idx])
+                        tmp_recall = 0.0 if len(v[idx]) == 0 else np.mean(v[idx])
                         class_recall.append(tmp_recall)
                         sum_recall += tmp_recall
                     print('Class Mean R@{}: '.format(k), class_recall)
                     print('Overall Mean R@%i: %f' % (k, sum_recall / float(self.num_rel)))
                     f.write('R@%i: %f\n' % (k, sum_recall / float(self.num_rel)))
-            
+
             if self.print_cls_rec2:
                 print('             ----------- class recall way 2 ----------')
                 for k, v in self.result_dict[self.mode + '_recall'].items():
                     avg = 0
                     per_class_recall = []
                     for idx in range(self.tot_all_predicates):
-                        #print(self.result_dict[self.mode + '_recall_hit'][k][idx+1])
-                        tmp_avg = float(self.result_dict[self.mode + '_recall_hit'][k][idx]) / float(self.result_dict[self.mode +'_recall_count'] [k][idx] + 1e-10)
-
+                        tmp_avg = float(self.result_dict[self.mode + '_recall_hit'][k][idx]) / \
+                                  float(self.result_dict[self.mode + '_recall_count'][k][idx] + 1e-10)
                         avg += tmp_avg
                         per_class_recall.append(tmp_avg)
-                    
                     print('Class Mean R@{}: '.format(k), per_class_recall)
-                    print('mR@%i: %f'% (k,avg/self.tot_all_predicates))
-                    
+                    print('mR@%i: %f' % (k, avg / self.tot_all_predicates))
+
         if self.error_analysis:
             print('----------- error analysis -----------')
             print(self.error_mat)
-            pdb.set_trace()         
-            
+            pdb.set_trace()
         return stats_dict
 
+    # ------------------------------------------------------------------
     def evaluate_scene_graph(self, gt, pred):
         '''collect the groundtruth and prediction'''
-        for idx, frame_gt in enumerate(gt): # gt[i] indices all annotations for the i-th frame
-            # generate the ground truth
-            gt_boxes = frame_gt['boxes']
-            gt_classes = np.array(frame_gt['labels'])
-            gt_relations = []
-            human_idx = 0
-            for obj_idx in range(len(frame_gt['obj_labels'])):
-                gt_relations.append([human_idx, obj_idx+1, int(torch.where(frame_gt['attn_labels'][obj_idx])[0])]) # for attention triplet <human-object-predicate>_
-                #spatial and contacting relationship could be multiple
-                spatial_idxes = torch.where(frame_gt['spatial_labels'][obj_idx])[0]
-                for spatial in spatial_idxes:
-                    gt_relations.append([obj_idx+1, human_idx, self.num_attn + spatial]) # for spatial triplet <object-human-predicate>
-                contact_idxes = torch.where(frame_gt['contacting_labels'][obj_idx])[0]
-                for contact in contact_idxes:
-                    gt_relations.append([human_idx, obj_idx+1, self.num_attn + self.num_spatial + contact])  # for contact triplet <human-object-predicate>
+        # build = self._build_entries_ag if self.version == 'ag' else self._build_entries_star
+        ###
+        if self.vocab_match:
+            build = self._build_entries_ag_vocab
+        else:
+            build = self._build_entries_ag if self.version == 'ag' else self._build_entries_star
+        ###
+        for idx, frame_gt in enumerate(gt):
+            entries = build(frame_gt, pred[idx])
+            if entries is None:
+                continue
+            gt_entry, pred_entry = entries
+            self.evaluate_from_dict(gt_entry, pred_entry, self.mode, iou_thresh=self.iou_threshold,
+                                    method=self.constraint, threshold=self.semithreshold,
+                                    num_rel=self.num_rel, error_mat=self.error_mat, nms_filter=self.nms_filter)
 
-            gt_entry = {
-                'gt_classes': gt_classes,   
-                'gt_relations': np.array(gt_relations),
-                'gt_boxes': np.array(box_cxcywh_to_xyxy(gt_boxes)),
+    def _make_pred_entry(self, p, rels_i, rel_scores, extra=None):
+        if self.mode == 'predcls':
+            entry = {
+                'pred_boxes': box_cxcywh_to_xyxy(torch.tensor(p['target_boxes'])).numpy(),
+                'pred_classes': p['target_labels'],
+                'pred_rel_inds': rels_i,
+                'obj_scores': p['target_scores'],
+                'rel_scores': rel_scores,
             }
-            if 'img_path' in frame_gt.keys():
-                gt_entry['img_path'] = frame_gt['img_path']
+        elif self.mode == 'sgcls':
+            entry = {
+                'pred_boxes': box_cxcywh_to_xyxy(torch.tensor(p['target_boxes'])).numpy(), # TODO: test with pred_boxes
+                'pred_classes': p['pred_labels'],
+                'pred_rel_inds': rels_i,
+                'obj_scores': p['pred_scores'],
+                'rel_scores': rel_scores,
+            }
+        else:
+            entry = {
+                'pred_boxes': box_cxcywh_to_xyxy(torch.tensor(p['pred_boxes'])).numpy(),
+                'pred_classes': p['pred_labels'],
+                'pred_rel_inds': rels_i,
+                'obj_scores': p['pred_scores'],
+                'rel_scores': rel_scores,
+            }
+        if extra and self.mode == 'predcls':
+            entry.update(extra)
+        return entry
 
+    # ---------------------------- AG (original behavior) ----------------------------
+    def _build_entries_ag(self, frame_gt, p):
+        gt_boxes = frame_gt['boxes']
+        gt_classes = np.array(frame_gt['labels'])
+        gt_relations = []
+        human_idx = 0
+        for obj_idx in range(len(frame_gt['obj_labels'])):
+            gt_relations.append([human_idx, obj_idx+1, int(torch.where(frame_gt['attn_labels'][obj_idx])[0])])  # attention <human-object-predicate>
+            spatial_idxes = torch.where(frame_gt['spatial_labels'][obj_idx])[0]
+            for spatial in spatial_idxes:
+                gt_relations.append([obj_idx+1, human_idx, self.num_attn + spatial])                             # spatial <object-human-predicate>
+            contact_idxes = torch.where(frame_gt['contacting_labels'][obj_idx])[0]
+            for contact in contact_idxes:
+                gt_relations.append([human_idx, obj_idx+1, self.num_attn + self.num_spatial + contact])          # contact <human-object-predicate>
 
-            # first part for attention and contact, second for spatial
-            rels_i = np.concatenate((pred[idx]['pair_idx'],             #attention
-                                     pred[idx]['pair_idx'][:,::-1],     #spatial
-                                     pred[idx]['pair_idx']), axis=0)    #contacting
-            pred_scores_1 = np.concatenate((pred[idx]['attention_distribution'],
-                                            np.zeros([pred[idx]['pair_idx'].shape[0], pred[idx]['spatial_distribution'].shape[1]]),
-                                            np.zeros([pred[idx]['pair_idx'].shape[0], pred[idx]['contacting_distribution'].shape[1]])), axis=1)
-            pred_scores_2 = np.concatenate((np.zeros([pred[idx]['pair_idx'].shape[0], pred[idx]['attention_distribution'].shape[1]]),
-                                            pred[idx]['spatial_distribution'],
-                                            np.zeros([pred[idx]['pair_idx'].shape[0], pred[idx]['contacting_distribution'].shape[1]])), axis=1)
-            pred_scores_3 = np.concatenate((np.zeros([pred[idx]['pair_idx'].shape[0], pred[idx]['attention_distribution'].shape[1]]),
-                                            np.zeros([pred[idx]['pair_idx'].shape[0], pred[idx]['spatial_distribution'].shape[1]]),
-                                            pred[idx]['contacting_distribution']), axis=1)
-            
-            all_rel_scores = np.concatenate((pred[idx]['attention_distribution'],\
-                                              pred[idx]['spatial_distribution'],\
-                                              pred[idx]['contacting_distribution']), axis=1)
-            if self.mode == 'predcls':
-                pred_entry = {
-                    'pred_boxes': box_cxcywh_to_xyxy(torch.tensor(pred[idx]['target_boxes'])).numpy(),
-                    'pred_classes': pred[idx]['target_labels'],
-                    'pred_rel_inds': rels_i,
-                    'obj_scores': pred[idx]['target_scores'],
-                    'rel_scores': np.concatenate((pred_scores_1, pred_scores_2, pred_scores_3), axis=0),
+        gt_entry = {
+            'gt_classes': gt_classes,
+            'gt_relations': np.array(gt_relations),
+            'gt_boxes': np.array(box_cxcywh_to_xyxy(gt_boxes)),
+        }
+        if 'img_path' in frame_gt.keys():
+            gt_entry['img_path'] = frame_gt['img_path']
 
-                    'pred_so_labels': pred[idx]['pair_idx'],
-                    'pred_so_attn': pred[idx]['attention_distribution'],
-                    'pred_so_spatial': pred[idx]['spatial_distribution'],
-                    'pred_so_contacting': pred[idx]['contacting_distribution'],
-                }
-            elif self.mode == 'sgcls':
-                pred_entry = {
-                    'pred_boxes': box_cxcywh_to_xyxy(torch.tensor(pred[idx]['target_boxes'])).numpy(), # TODO: test with pred_boxes
-                    'pred_classes': pred[idx]['pred_labels'],
-                    'pred_rel_inds': rels_i,
-                    'obj_scores': pred[idx]['pred_scores'],
-                    'rel_scores': np.concatenate((pred_scores_1, pred_scores_2, pred_scores_3), axis=0)
-                }
-            else:
-                pred_entry = {
-                    'pred_boxes': box_cxcywh_to_xyxy(torch.tensor(pred[idx]['pred_boxes'])).numpy(),
-                    'pred_classes': pred[idx]['pred_labels'],
-                    'pred_rel_inds': rels_i,
-                    'obj_scores': pred[idx]['pred_scores'],
-                    'rel_scores': np.concatenate((pred_scores_1, pred_scores_2, pred_scores_3), axis=0)
-                }
-            self.evaluate_from_dict(gt_entry, pred_entry, self.mode, iou_thresh=self.iou_threshold, method=self.constraint, 
-                                    threshold=self.semithreshold, num_rel= self.num_rel, error_mat=self.error_mat, nms_filter=self.nms_filter)
+        P = p['pair_idx'].shape[0]
+        n_attn = p['attention_distribution'].shape[1]
+        n_sp = p['spatial_distribution'].shape[1]
+        n_co = p['contacting_distribution'].shape[1]
+        rels_i = np.concatenate((p['pair_idx'],             # attention
+                                 p['pair_idx'][:, ::-1],    # spatial
+                                 p['pair_idx']), axis=0)    # contacting
+        pred_scores_1 = np.concatenate((p['attention_distribution'], np.zeros([P, n_sp]), np.zeros([P, n_co])), axis=1)
+        pred_scores_2 = np.concatenate((np.zeros([P, n_attn]), p['spatial_distribution'], np.zeros([P, n_co])), axis=1)
+        pred_scores_3 = np.concatenate((np.zeros([P, n_attn]), np.zeros([P, n_sp]), p['contacting_distribution']), axis=1)
+        rel_scores = np.concatenate((pred_scores_1, pred_scores_2, pred_scores_3), axis=0)
+
+        extra = {
+            'pred_so_labels': p['pair_idx'],
+            'pred_so_attn': p['attention_distribution'],
+            'pred_so_spatial': p['spatial_distribution'],
+            'pred_so_contacting': p['contacting_distribution'],
+        }
+        return gt_entry, self._make_pred_entry(p, rels_i, rel_scores, extra)
+
+    # ---------------------------- STAR (new behavior) ----------------------------
+    def _build_entries_star(self, frame_gt, p):
+        n = len(frame_gt['obj_labels'])
+        if n == 0:
+            return None   # no GT triplets (evaluate_recall asserts on this)
+
+        # boxes/classes laid out as [subjects(0..n-1), objects(n..2n-1)], same as PostProcessDSGGOO
+        subj_labels = frame_gt['subj_labels'].cpu().numpy()
+        obj_labels = frame_gt['obj_labels'].cpu().numpy()
+        gt_classes = np.concatenate([subj_labels, obj_labels])
+        gt_boxes = torch.cat([frame_gt['sub_boxes'].cpu(), frame_gt['obj_boxes'].cpu()], dim=0)
+        spatial_gt = frame_gt['spatial_labels'].cpu()
+        contact_gt = frame_gt['contacting_labels'].cpu()
+
+        gt_relations, gt_is_oo = [], []
+        for i in range(n):
+            is_oo = bool(subj_labels[i] != self.person_id)
+            for c in torch.where(spatial_gt[i])[0].tolist():
+                gt_relations.append([i, n + i, c])                       # <subject, spatial, object>
+                gt_is_oo.append(is_oo)
+            for c in torch.where(contact_gt[i])[0].tolist():
+                gt_relations.append([i, n + i, self.num_spatial + c])    # <subject, contacting, object>
+                gt_is_oo.append(is_oo)
+        if len(gt_relations) == 0:
+            return None
+
+        gt_entry = {
+            'gt_classes': gt_classes,
+            'gt_relations': np.array(gt_relations),
+            'gt_boxes': np.array(box_cxcywh_to_xyxy(gt_boxes)),
+            'gt_is_oo': np.array(gt_is_oo, dtype=bool),
+        }
+        if 'img_path' in frame_gt.keys():
+            gt_entry['img_path'] = frame_gt['img_path']
+
+        spatial, contact = p['spatial_distribution'], p['contacting_distribution']
+        assert spatial.shape[1] == self.num_spatial and contact.shape[1] == self.num_contact, \
+            'prediction width does not match REL_GROUPS'
+        P = p['pair_idx'].shape[0]
+        rels_i = np.concatenate((p['pair_idx'], p['pair_idx']), axis=0)
+        rel_scores = np.concatenate((
+            np.concatenate((spatial, np.zeros([P, self.num_contact])), axis=1),
+            np.concatenate((np.zeros([P, self.num_spatial]), contact), axis=1)), axis=0)
+        return gt_entry, self._make_pred_entry(p, rels_i, rel_scores)
+
+    ###
+    def _build_entries_ag_vocab(self, frame_gt, p):
+        sp_map = {c: i for i, c in enumerate(KEEP_SP)}
+        co_map = {c: i for i, c in enumerate(KEEP_CO)}
+        rels = []
+        for o in range(len(frame_gt['obj_labels'])):
+            for c in torch.where(frame_gt['spatial_labels'][o])[0].tolist():
+                if c in sp_map:
+                    rels.append([o + 1, 0, sp_map[c]])                         # <object, human, spatial>
+            for c in torch.where(frame_gt['contacting_labels'][o])[0].tolist():
+                if c in co_map:
+                    rels.append([0, o + 1, self.num_spatial + co_map[c]])      # <human, object, contact>
+        if not rels:
+            return None                                                       # same frames dropped as in your filtered test set
+        gt_entry = {'gt_classes': np.array(frame_gt['labels']),
+                    'gt_relations': np.array(rels),
+                    'gt_boxes': np.array(box_cxcywh_to_xyxy(frame_gt['boxes']))}
+
+        sp = p['spatial_distribution'][:, KEEP_SP]
+        co = p['contacting_distribution'][:, KEEP_CO]
+        P = p['pair_idx'].shape[0]
+        rels_i = np.concatenate((p['pair_idx'][:, ::-1], p['pair_idx']), axis=0)
+        rel_scores = np.concatenate((
+            np.concatenate((sp, np.zeros([P, self.num_contact])), axis=1),
+            np.concatenate((np.zeros([P, self.num_spatial]), co), axis=1)), axis=0)
+        return gt_entry, self._make_pred_entry(p, rels_i, rel_scores)
+    ###
 
     def evaluate_from_dict(self, gt_entry, pred_entry, mode, method=None, threshold = 0.9, num_rel=26, **kwargs):
         """
@@ -275,6 +412,13 @@ class BasicSceneGraphEvaluator:
             self.result_dict[mode + '_recall'][k].append(rec_i)
             # result_dict[mode + '_pair_recall'][k].append(rec_i_pair)
 
+            gt_is_oo = gt_entry.get('gt_is_oo')          # only present for the STAR version
+            if gt_is_oo is not None:
+                hit = np.asarray(match, dtype=int)       # GT triplets recovered in the top-k
+                for name, mask in (('person', ~gt_is_oo), ('objobj', gt_is_oo)):
+                    if mask.any():
+                        self.result_dict[f'{mode}_recall_{name}'][k].append(mask[hit].sum() / mask.sum())
+        
             # if self.constraint == 'no' and k == 10:
             #     if rec_i < 0.83:
             #         pred_so_labels = pred_entry['pred_classes'][pred_entry['pred_so_labels']]

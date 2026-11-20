@@ -83,7 +83,9 @@ class DSGGDataset(TvCocoDetection):
             sample_range = list(range(left, right + 1))
             if self.filter_key_img and img_id in sample_range:
                 sample_range.remove(img_id)
-            while len(sample_range) < self.num_ref_frames:
+            if len(sample_range) == 0:
+                print(f"img_ids={img_ids}, img_id={img_id}, video_id={video_id}")
+            while len(sample_range) < self.num_ref_frames and len(sample_range) > 0:
                 print('sample range:', sample_range)
                 sample_range.extend(sample_range)
             ref_img_ids = random.sample(sample_range, self.num_ref_frames)
@@ -292,12 +294,12 @@ def make_coco_transforms(image_set):
 
 
 def build(image_set, args):
-    root = Path(args.ag_path)
-    assert root.exists(), f'provided Action Genome path {root} does not exist'
+    root = Path(args.data_path)
+    assert root.exists(), f'provided data path {root} does not exist'
     mode = 'instances'
     PATHS = {
-        "train": (root, root / "annotations" / 'ag_train_coco_style.json'),
-        "val": (root, root / "annotations" / 'ag_test_coco_style.json'),
+        "train": (root / "action-genome", root / "action-genome" / "annotations" / args.train_annotations_file),
+        "val": (root / "action-genome", root / "action-genome" / "annotations" / args.test_annotations_file),
     }
     img_folder, anno_file = PATHS[image_set]
     dataset = DSGGDataset(img_folder, anno_file, transforms=make_coco_transforms(image_set), is_train=(not args.eval), 

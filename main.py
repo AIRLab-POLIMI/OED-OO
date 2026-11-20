@@ -19,9 +19,12 @@ from tqdm import tqdm
 
 from torch.utils.tensorboard import SummaryWriter
 
+from util.misc import sync_scalar, broadcast_flag
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
+    parser.add_argument('--eval_star_vocab', action='store_true', default=False)
+
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_backbone', default=1e-5, type=float)
     parser.add_argument('--batch_size', default=2, type=int)
@@ -84,6 +87,8 @@ def get_args_parser():
                         help="L1 box coefficient in the matching cost")
     parser.add_argument('--set_cost_giou', default=1, type=float,
                         help="giou box coefficient in the matching cost")
+    parser.add_argument('--set_cost_subj_class', default=1, type=float,
+                        help="Subject class coefficient in the matching cost")
     parser.add_argument('--set_cost_obj_class', default=1, type=float,
                         help="Object class coefficient in the matching cost")
     parser.add_argument('--set_cost_verb_class', default=1, type=float,
@@ -106,8 +111,10 @@ def get_args_parser():
                         help="Relative classification weight of the no-object class")
 
     # dataset parameters
+    parser.add_argument('--train_annotations_file', default='ag_train_coco_style.json')
+    parser.add_argument('--test_annotations_file', default='ag_test_coco_style.json')
     parser.add_argument('--dataset_file', default='ag_single')
-    parser.add_argument('--ag_path', type=str)
+    parser.add_argument('--data_path', default='data')
 
     parser.add_argument('--output_dir', default='',
                         help='path where to save, empty for no saving')
@@ -175,14 +182,26 @@ def get_args_parser():
     parser.add_argument('--p_rel', default=0.7, type=float,
                         help='Reweighting parameter for verb')
 
+    # validation / early stopping
+    parser.add_argument('--val_interval', default=1, type=int,
+                        help='validate every N epochs (0 disables validation)')
+    parser.add_argument('--patience', default=0, type=int,
+                        help='stop after N validations without improvement (0 disables early stopping)')
+    parser.add_argument('--min_delta', default=0.0, type=float,
+                        help='minimum increase of the monitored metric to count as improvement')
+    parser.add_argument('--early_stop_metric', default='R@50', type=str,
+                        help="key of print_stats, e.g. R@20, R@50, R@50_person, R@50_objobj")
+    parser.add_argument('--early_stop_set', default='with', choices=['with', 'no'],
+                        help="which evaluator to monitor: 'with' or 'no' constraint")
+
 
     return parser
 
 
 def main(args):
-    if args.dataset_file == 'ag_single':
+    if args.dataset_file == 'ag_single' or args.dataset_file == 'star_single':
         import util.misc as utils
-    elif args.dataset_file == 'ag_multi':
+    elif args.dataset_file == 'ag_multi' or args.dataset_file == 'star_multi':
         import util.misc_multi as utils
     else:
         AssertionError('No support for this dataset')
@@ -338,15 +357,30 @@ def main(args):
             model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
     if args.eval:
         test_stats = evaluate_dsgg(args.dataset_file, model, postprocessors, data_loader_val, device, args)
-        # evaluate_speed(args.dataset_file, model, postprocessors, data_loader_val, device, args)
         return
 
     print("Start training")
     start_time = time.time()
-    best_performance = 0
+
     writer = None
     if 'pdb' not in args.output_dir:
         writer = SummaryWriter(args.output_dir + 'curve')
+    
+    best_metric = -float('inf')
+    epochs_no_improve = 0
+    if args.resume and 'best_metric' in locals().get('checkpoint', {}): 
+        best_metric = checkpoint['best_metric']
+        epochs_no_improve = checkpoint.get('epochs_no_improve', 0)
+
+    def make_ckpt(epoch):
+        return {'model': model_without_ddp.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'lr_scheduler': lr_scheduler.state_dict(),
+                'epoch': epoch,
+                'best_metric': best_metric,
+                'epochs_no_improve': epochs_no_improve,
+                'args': args}
+
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_train.set_epoch(epoch)
@@ -355,62 +389,54 @@ def main(args):
             args.clip_max_norm, args, writer)
         lr_scheduler.step()
 
-        if epoch == args.epochs - 1:
-            checkpoint_path = os.path.join(output_dir, 'checkpoint_last.pth')
-            utils.save_on_master({
-                'model': model_without_ddp.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'lr_scheduler': lr_scheduler.state_dict(),
-                'epoch': epoch,
-                'args': args,
-            }, checkpoint_path)
+        # ---------------- validation + early stopping ----------------
+        test_stats, stop = {}, False
+        do_val = args.val_interval > 0 and ((epoch + 1) % args.val_interval == 0 or epoch == args.epochs - 1)
+        if do_val:
+            test_stats = evaluate_dsgg(args.dataset_file, model, postprocessors, data_loader_val, device, args)
+            model.train()
+            criterion.train()
 
-        # new added save script
-        if (args.dataset_file == 'ag_single' and epoch % 1 == 0) or \
-            (args.dataset_file == 'ag_multi' and epoch % 1 == 0):
-            checkpoint_path = os.path.join(output_dir, 'checkpoint_{}.pth'.format(epoch))
-            utils.save_on_master({
-                'model': model_without_ddp.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'lr_scheduler': lr_scheduler.state_dict(),
-                'epoch': epoch,
-                'args': args,
-            }, checkpoint_path)
+            raw = float(test_stats[args.early_stop_set].get(args.early_stop_metric, float('nan')))
+            current = sync_scalar(raw, device, args)
+            improved = np.isfinite(current) and current > best_metric + args.min_delta
+            if improved:
+                best_metric, epochs_no_improve = current, 0
+                utils.save_on_master(make_ckpt(epoch), os.path.join(output_dir, 'checkpoint_best.pth'))
+            else:
+                epochs_no_improve += 1
+            print(f'[val] epoch {epoch}: {args.early_stop_set}/{args.early_stop_metric}={current:.4f} '
+                  f'best={best_metric:.4f} no_improve={epochs_no_improve}/{args.patience}')
 
-        ## evaluation one epoch every some epochs and save the best model accoding to the evaluation metic
-        # if args.freeze_mode == 0 and epoch < args.lr_drop and epoch % 5 != 0:  ## eval every 5 epoch before lr_drop
-        #     continue
-        # elif args.freeze_mode == 0 and epoch >= args.lr_drop and epoch % 2 == 0:  ## eval every 2 epoch after lr_drop
-        #     continue
-        # test_stats = evaluate_dsgg(args.dataset_file, model, postprocessors, data_loader_val, device, args)
-        # test_with_stats = test_stats['with']
-        # test_semi_stats = test_stats['semi']
-        # test_no_stats = test_stats['no']
+            if writer is not None and utils.is_main_process():
+                for s, d in test_stats.items():
+                    for k, v in d.items():
+                        if np.isfinite(v):
+                            writer.add_scalar(f'val_{s}/{k}', float(v), epoch)
 
-        # if performance > best_performance:
-        #     checkpoint_path = os.path.join(output_dir, 'checkpoint_best.pth')
-        #     utils.save_on_master({
-        #         'model': model_without_ddp.state_dict(),
-        #         'optimizer': optimizer.state_dict(),
-        #         'lr_scheduler': lr_scheduler.state_dict(),
-        #         'epoch': epoch,
-        #         'args': args,
-        #     }, checkpoint_path)
-        
-        #     best_performance = performance
+            stop = args.patience > 0 and epochs_no_improve >= args.patience
+            stop = broadcast_flag(stop, device, args)
+
+        # ---------------- checkpoints ----------------
+        if epoch == args.epochs - 1 or stop:
+            utils.save_on_master(make_ckpt(epoch), os.path.join(output_dir, 'checkpoint_last.pth'))
+        utils.save_on_master(make_ckpt(epoch), os.path.join(output_dir, 'checkpoint_{}.pth'.format(epoch)))
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     # **{f'test_with_{k}': v for k, v in test_with_stats.items()},
-                     # **{f'test_semi_{k}': v for k, v in test_semi_stats.items()},
-                     # **{f'test_no_{k}': v for k, v in test_no_stats.items()},
+                     **{f'val_{s}_{k}': float(v) for s, d in test_stats.items() for k, v in d.items()},
                      'epoch': epoch,
                      'n_parameters': n_parameters}
-
         if args.output_dir and utils.is_main_process():
             with (output_dir / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
 
-    writer.close()
+        if stop:
+            print(f'Early stopping at epoch {epoch}: no improvement for {epochs_no_improve} validations.')
+            break
+
+    if writer is not None:
+        writer.close()
+
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))

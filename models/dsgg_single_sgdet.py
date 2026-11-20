@@ -84,6 +84,70 @@ class CDNDSGG(nn.Module):
                                             outputs_spatial_class[-min_dec_layers_num : -1], outputs_contacting_class[-min_dec_layers_num : -1])]
 
 
+class CDNDSGGOO(nn.Module):
+
+    def __init__(self, backbone, transformer, num_obj_classes, num_queries, aux_loss=False, args=None):
+        super().__init__()
+        # task determines whether object pair detection results are given
+        self.dsgg_task = args.dsgg_task
+
+        # model parameters
+        self.num_queries = num_queries
+        self.transformer = transformer
+        hidden_dim = transformer.d_model
+        self.query_embed = nn.Embedding(num_queries, hidden_dim)
+
+        self.subj_class_embed = nn.Linear(hidden_dim, num_obj_classes) # NOTE Option A - no empty padding for subj labels
+        self.obj_class_embed = nn.Linear(hidden_dim, num_obj_classes + 1)
+        self.spatial_class_embed = nn.Linear(hidden_dim, args.num_spatial_classes)
+        self.contacting_class_embed = nn.Linear(hidden_dim, args.num_contacting_classes)
+        self.sub_bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        self.obj_bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
+        self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
+        self.backbone = backbone
+
+        # hyperparameters
+        self.aux_loss = aux_loss
+        self.use_matching = args.use_matching
+        self.dec_layers_hopd = args.dec_layers_hopd
+        self.dec_layers_interaction = args.dec_layers_interaction
+
+    def forward(self, samples: NestedTensor, targets=None):
+        if not isinstance(samples, NestedTensor):
+            samples = nested_tensor_from_tensor_list(samples)
+        features, pos = self.backbone(samples)
+
+        src, mask = features[-1].decompose()
+        assert mask is not None
+        # hopd_out, interaction_decoder_out = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[:2]
+        hopd_out, interaction_decoder_out, ins_attn_weight, rel_attn_weight = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[:4]
+
+        outputs_sub_coord = self.sub_bbox_embed(hopd_out).sigmoid()
+        outputs_obj_coord = self.obj_bbox_embed(hopd_out).sigmoid()
+        outputs_subj_class = self.subj_class_embed(hopd_out)
+        outputs_obj_class = self.obj_class_embed(hopd_out)
+
+        outputs_spatial_class = self.spatial_class_embed(interaction_decoder_out)
+        outputs_contacting_class = self.contacting_class_embed(interaction_decoder_out)
+        out = {'pred_subj_logits': outputs_subj_class[-1], 'pred_obj_logits': outputs_obj_class[-1], 'pred_sub_boxes': outputs_sub_coord[-1], 'pred_obj_boxes': outputs_obj_coord[-1],
+               'pred_spatial_logits': outputs_spatial_class[-1], 'pred_contacting_logits': outputs_contacting_class[-1],
+               'ins_attn_weight': ins_attn_weight, 'rel_attn_weight': rel_attn_weight}
+
+        if self.aux_loss:                      
+            out['aux_outputs'] = self._set_aux_loss(outputs_subj_class, outputs_obj_class, outputs_sub_coord, outputs_obj_coord,
+                                                    outputs_spatial_class, outputs_contacting_class)
+
+        return out
+
+    @torch.jit.unused
+    def _set_aux_loss(self, outputs_subj_class, outputs_obj_class, outputs_sub_coord, outputs_obj_coord, outputs_spatial_class, outputs_contacting_class):
+        min_dec_layers_num = min(self.dec_layers_hopd, self.dec_layers_interaction)
+        return [{'pred_subj_logits': a, 'pred_obj_logits': b, 'pred_sub_boxes': c, 'pred_obj_boxes': d, 'pred_spatial_logits': e, 'pred_contacting_logits': f}
+                for a, b, c, d, e, f in zip(outputs_subj_class[-min_dec_layers_num : -1], outputs_obj_class[-min_dec_layers_num : -1], \
+                                            outputs_sub_coord[-min_dec_layers_num : -1], outputs_obj_coord[-min_dec_layers_num : -1], \
+                                            outputs_spatial_class[-min_dec_layers_num : -1], outputs_contacting_class[-min_dec_layers_num : -1])]
+
+
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
         super().__init__()
@@ -370,7 +434,7 @@ class SetCriterionDSGG(nn.Module):
                 indices = self.matcher(aux_outputs, targets)
                 for loss in self.losses:
                     kwargs = {}
-                    if loss == 'obj_labels':
+                    if loss in ('obj_labels', 'subj_labels'):
                         kwargs = {'log': False}
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_interactions, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
@@ -378,6 +442,81 @@ class SetCriterionDSGG(nn.Module):
 
         return losses
 
+class SetCriterionDSGGOO(SetCriterionDSGG):
+
+    def __init__(self, num_obj_classes, num_queries, matcher, weight_dict, eos_coef, losses, args):
+        super(SetCriterionDSGG, self).__init__()
+
+        self.num_obj_classes = num_obj_classes
+        self.num_queries = num_queries
+        self.num_spatial_classes = args.num_spatial_classes
+        self.num_contacting_classes = args.num_contacting_classes
+        self.matcher = matcher
+        self.weight_dict = weight_dict
+        self.eos_coef = eos_coef
+        self.losses = losses
+        empty_weight = torch.ones(self.num_obj_classes + 1)
+        empty_weight[-1] = self.eos_coef
+        self.register_buffer('empty_weight', empty_weight)
+
+        self.alpha = args.alpha
+
+    def loss_subj_labels(self, outputs, targets, indices, num_interactions, log=True): # NOTE Option A
+        assert 'pred_subj_logits' in outputs
+        src_logits = outputs['pred_subj_logits']
+        idx = self._get_src_permutation_idx(indices)
+        target_classes_o = torch.cat([t['subj_labels'][J] for t, (_, J) in zip(targets, indices)])
+        matched_logits = src_logits[idx]
+
+        if target_classes_o.numel() == 0:
+            # avoid NaN from CE on an empty tensor
+            losses = {'loss_subj_ce': matched_logits.sum() * 0}
+        else:
+            losses = {'loss_subj_ce': F.cross_entropy(matched_logits, target_classes_o)}
+
+        if log and target_classes_o.numel() > 0:
+            losses['subj_class_error'] = 100 - accuracy(matched_logits, target_classes_o)[0]
+        return losses
+
+    def loss_relation_labels(self, outputs, targets, indices, num_interactions): 
+        num_spatial_rel, num_contacting_rel = self.num_spatial_classes, self.num_contacting_classes
+        spatial_logits = outputs['pred_spatial_logits'].reshape(-1, num_spatial_rel)
+        contacting_logits = outputs['pred_contacting_logits'].reshape(-1, num_contacting_rel)
+        spatial_probs = spatial_logits.sigmoid()
+        contacting_probs = contacting_logits.sigmoid()
+
+        idx = self._get_src_permutation_idx(indices)
+        idx = (idx[0].to(spatial_logits.device), idx[1].to(spatial_logits.device))
+    
+        target_spatial_classes_o = torch.cat([t['spatial_labels'][J] for t, (_, J) in zip(targets, indices)])
+        target_contacting_classes_o = torch.cat([t['contacting_labels'][J] for t, (_, J) in zip(targets, indices)])
+
+        ## only select matched query to calculate loss
+        sel_idx = idx[0] * outputs['pred_spatial_logits'].shape[1] + idx[1]
+        spatial_probs = spatial_probs[sel_idx]
+        contacting_probs = contacting_probs[sel_idx]
+        target_spatial_classes = target_spatial_classes_o
+        target_contacting_classes = target_contacting_classes_o
+        ## -----------------------------------
+
+        loss_spatial_ce = self._neg_loss(spatial_probs, target_spatial_classes, alpha=self.alpha)
+        loss_contacting_ce = self._neg_loss(contacting_probs, target_contacting_classes, alpha=self.alpha)
+        
+        losses = {'loss_spatial_ce': loss_spatial_ce, 'loss_contacting_ce': loss_contacting_ce}
+
+        return losses
+
+    def get_loss(self, loss, outputs, targets, indices, num, **kwargs):
+        loss_map = {
+            'subj_labels': self.loss_subj_labels,
+            'obj_labels': self.loss_obj_labels,
+            'obj_cardinality': self.loss_obj_cardinality,
+            'relation_labels': self.loss_relation_labels,
+            'sub_obj_boxes': self.loss_sub_obj_boxes,
+            'matching_labels': self.loss_matching_labels
+        }
+        assert loss in loss_map, f'do you really want to compute {loss} loss?'
+        return loss_map[loss](outputs, targets, indices, num, **kwargs)
 
 class PostProcessDSGG(nn.Module):
 
@@ -423,8 +562,52 @@ class PostProcessDSGG(nn.Module):
 
         return results
 
+class PostProcessDSGGOO(nn.Module):
 
-def build(args):
+    def __init__(self, args):
+        super().__init__()
+        self.use_matching = args.use_matching
+
+    @torch.no_grad()
+    def forward(self, outputs, target_sizes):
+        out_subj_logits = outputs['pred_subj_logits']
+        out_obj_logits = outputs['pred_obj_logits']
+        out_sub_boxes = outputs['pred_sub_boxes']
+        out_obj_boxes = outputs['pred_obj_boxes']
+        out_spatial_logits = outputs['pred_spatial_logits']
+        out_contacting_logits = outputs['pred_contacting_logits']
+
+        assert len(out_obj_logits) == len(target_sizes)
+        assert len(out_subj_logits) == len(target_sizes)
+        assert target_sizes.shape[1] == 2
+
+        subj_prob = F.softmax(out_subj_logits, -1)
+        subj_scores, subj_labels = subj_prob.max(-1) # NOTE Option A
+
+        obj_prob = F.softmax(out_obj_logits, -1)
+        obj_scores, obj_labels = obj_prob[..., :-1].max(-1)
+
+        spatial_probs = out_spatial_logits.sigmoid()
+        contacting_probs = out_contacting_logits.sigmoid()
+        out_boxes = torch.cat([out_sub_boxes, out_obj_boxes], dim=1)
+
+        results = []
+        for index in range(len(target_sizes)):
+            frame_pred = {}
+            frame_pred['pred_scores'] = torch.cat([subj_scores[index].cpu(), obj_scores[index].cpu()]).numpy()
+            frame_pred['pred_labels'] = torch.cat([subj_labels[index].cpu(), obj_labels[index].cpu()]).numpy()
+            frame_pred['pred_boxes'] = out_boxes[index].cpu().numpy()
+            frame_pred['pair_idx'] = torch.cat([torch.arange(out_sub_boxes.shape[1])[:, None], \
+                                                torch.arange(out_sub_boxes.shape[1], 2 * out_sub_boxes.shape[1])[:, None]], dim=1).cpu().numpy()
+            frame_pred['spatial_distribution'] = spatial_probs[index].cpu().numpy()
+            frame_pred['contacting_distribution'] = contacting_probs[index].cpu().numpy()
+
+            results.append(frame_pred)
+
+        return results
+
+
+def build_ag(args):
 
     if 'ag' in args.dataset_file:
         num_classes = 36 + 1
@@ -473,5 +656,56 @@ def build(args):
 
     criterion.to(device)
     postprocessors = {'dsgg': PostProcessDSGG(args)}
+
+    return model, criterion, postprocessors
+
+def build_star(args):
+    if 'star' in args.dataset_file:
+        num_classes = 36 + 1
+
+    device = torch.device(args.device)
+
+    backbone = build_backbone(args)
+
+    cdn = build_cdn(args)
+
+    model = CDNDSGGOO(
+        backbone,
+        cdn,
+        num_obj_classes=num_classes,
+        num_queries=args.num_queries,
+        aux_loss=args.aux_loss,
+        args=args
+    )
+
+    matcher = build_matcher(args)
+    weight_dict = {}
+    weight_dict['loss_subj_ce'] = args.obj_loss_coef
+    weight_dict['loss_obj_ce'] = args.obj_loss_coef
+    weight_dict['loss_spatial_ce'] = args.rel_loss_coef
+    weight_dict['loss_contacting_ce'] = args.rel_loss_coef
+    weight_dict['loss_sub_bbox'] = args.bbox_loss_coef
+    weight_dict['loss_obj_bbox'] = args.bbox_loss_coef
+    weight_dict['loss_sub_giou'] = args.giou_loss_coef
+    weight_dict['loss_obj_giou'] = args.giou_loss_coef
+    if args.use_matching:
+        weight_dict['loss_matching'] = args.matching_loss_coef
+
+    if args.aux_loss:
+        min_dec_layers_num = min(args.dec_layers_hopd, args.dec_layers_interaction)
+        aux_weight_dict = {}
+        for i in range(min_dec_layers_num - 1):
+            aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
+        weight_dict.update(aux_weight_dict)
+
+    losses = ['subj_labels', 'obj_labels', 'relation_labels', 'sub_obj_boxes', 'obj_cardinality']
+    if args.use_matching:
+        losses.append('matching_labels')
+
+    criterion = SetCriterionDSGGOO(num_classes, args.num_queries, matcher=matcher,weight_dict=weight_dict, \
+                                 eos_coef=args.eos_coef, losses=losses, args=args)
+
+    criterion.to(device)
+    postprocessors = {'dsgg': PostProcessDSGGOO(args)}
 
     return model, criterion, postprocessors

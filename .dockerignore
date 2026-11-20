@@ -1,5 +1,6 @@
 data/
 exps/
+scripts/
 run.txt
 .git
 __pycache__

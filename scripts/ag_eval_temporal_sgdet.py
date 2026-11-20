@@ -12,8 +12,9 @@ def run_eval(device='0', ckpt_path='exps/params/sgdet/temporal/checkpoint_3.pth'
                     --nproc_per_node={num_devices} \
                     --use_env \
                     main.py \
+                    --train_annotations_file agstar_train_partial.json \
+                    --test_annotations_file ag_test_coco_style.json \
                     --dataset_file ag_multi \
-                    --ag_path data/action-genome \
                     --backbone resnet50 \
                     --num_queries 100 \
                     --dec_layers_hopd 6 \
@@ -30,4 +31,4 @@ def run_eval(device='0', ckpt_path='exps/params/sgdet/temporal/checkpoint_3.pth'
 
 if __name__ == "__main__":
     device = '0'
-    run_eval(device=device, ckpt_path='exps/params/sgdet/temporal/checkpoint_3.pth')
+    run_eval(device=device, ckpt_path='exps/temporal_sgdet_agstar_partial/checkpoint_5.pth')

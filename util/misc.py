@@ -446,3 +446,20 @@ def argsort_desc(scores):
              need to get the score.
     """
     return np.column_stack(np.unravel_index(np.argsort(-scores.ravel()), scores.shape))
+
+def sync_scalar(value, device, args):
+    """Average a metric across ranks (ignoring NaNs). Each rank only evaluates its own shard."""
+    if not args.distributed:
+        return value
+    ok = not np.isnan(value)
+    t = torch.tensor([value if ok else 0.0, 1.0 if ok else 0.0], device=device)
+    torch.distributed.all_reduce(t)
+    return (t[0] / t[1]).item() if t[1] > 0 else float('nan')
+
+def broadcast_flag(flag, device, args):
+    """Make every rank take the same stop decision, otherwise DDP deadlocks."""
+    if not args.distributed:
+        return flag
+    t = torch.tensor([int(flag)], device=device)
+    torch.distributed.broadcast(t, src=0)
+    return bool(t.item())

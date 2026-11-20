@@ -1,7 +1,22 @@
-docker build --rm -t busso/oed_base:v1 .
+docker build --rm -t busso/oed_*:v1 .
+docker rmi busso/oed_*
 
-oed_testing
+----------------------------------------
 
-run-docker 2 0-3 \
+tmux new -s oed_base_train / test - oed_mod_train / test
+
+# Press: Ctrl-b  then  d
+
+tmux attach -t name
+
+tmux kill-session -t name
+
+----------------------------------------
+
+run-docker gpu cpus \
+
 python scripts/eval_spatial_sgdet.py
 python scripts/eval_temporal_sgdet.py
+
+python scripts/train_spatial_sgdet.py   
+python scripts/train_temporal_sgdet.py 

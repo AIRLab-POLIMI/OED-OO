@@ -2,7 +2,7 @@ import os
 import sys
 import random
 
-def run_train(device='0', tag='spatial_predcls'):
+def run_train(device='0', tag='spatial_sgdet'):
     port = random.randint(10000,59999)
     num_devices = len(device.split(','))
     os.environ['CUDA_VISIBLE_DEVICES'] = device
@@ -13,20 +13,20 @@ def run_train(device='0', tag='spatial_predcls'):
                     --use_env \
                     main.py \
                     --output_dir exps/{tag}/ \
+                    --train_annotations_file agstar_train_partial.json \
                     --dataset_file ag_single \
-                    --ag_path data/action-genome \
                     --backbone resnet50 \
                     --num_queries 100 \
-                    --dec_layers_hopd 3 \
-                    --dec_layers_interaction 3 \
-                    --batch_size 2 \
-                    --epochs 12 \
-                    --lr_drop 9 \
+                    --dec_layers_hopd 6 \
+                    --dec_layers_interaction 6 \
+                    --batch_size 4 \
+                    --epochs 30 \
+                    --lr_drop 8 \
                     --pretrained exps/params/detr/detr-r50-pre-2stage_e29.pth \
-                    --dsgg_task predcls")
+                    --dsgg_task sgdet")
     
 
 
 if __name__ == "__main__":
-    device = '0,1,2,3,4,5,6,7'
-    run_train(device=device, tag='spatial_predcls')
+    device = '0'
+    run_train(device=device, tag='spatial_sgdet_agstar_partial')

@@ -1,8 +1,8 @@
-image_name: busso/oed_base:v1
+image_name: busso/oed_mod:v1
 container_name: {user}_GPU{args.gpu}_{date}
 
 # List of additional arguments to pass to 'docker run' every time.
 # -m 16G limits the container's memory to 16 GB (adjust as needed)
 # -v mounts a directory from the host into the container (host_path:container_path)
 # -p forwards a port from the container to the host (host_port:container_port)
-docker_args: -m 24G -v ~/storage/OED/data:/oed/data -v ~/storage/OED/exps:/oed/exps -v /multiverse/datasets/shared/action-genome/frames:/oed/data/action-genome/frames -v /multiverse/datasets/shared/charades/Charades_v1_480:/oed/data/action-genome/videos -p 8888:8888
+docker_args: -m 24G -v ~/storage/OED/data:/oed/data -v ~/storage/OED/exps:/oed/exps -v ~/storage/OED/scripts:/oed/scripts -v /megaverse/datasets/shared/action-genome/frames:/oed/data/action-genome/frames -v /megaverse/datasets/shared/charades/Charades_v1_480:/oed/data/action-genome/videos -p 8687:8687
